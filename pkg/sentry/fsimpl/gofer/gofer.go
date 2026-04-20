@@ -876,6 +876,10 @@ type inode struct {
 	atimeDirty atomicbitops.Uint32
 	mtimeDirty atomicbitops.Uint32
 
+	// xattrCache caches xattrs when cachedMetadataAuthoritative() is true. It is
+	// protected by metadataMu.
+	xattrCache xattrCache `state:"nosave"`
+
 	// nlink counts the number of hard links to this inode. It's updated and
 	// accessed using atomic operations. It's not protected by metadataMu like the
 	// other metadata fields.
@@ -1487,21 +1491,22 @@ func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) 
 }
 
 func (d *dentry) checkXattrPermissions(creds *auth.Credentials, name string, ats vfs.AccessTypes) error {
-	// Deny access to the "system" namespaces since applications
-	// may expect these to affect kernel behavior in unimplemented ways
-	// (b/148380782). Allow all other extended attributes to be passed through
-	// to the remote filesystem. This is inconsistent with Linux's 9p client,
-	// but consistent with other filesystems (e.g. FUSE).
-	//
-	// NOTE(b/202533394): Also disallow "trusted" namespace for now. This is
-	// consistent with the VFS1 gofer client.
-	if strings.HasPrefix(name, linux.XATTR_SYSTEM_PREFIX) || strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX) {
+	// Deny access to the "system" namespaces since applications may expect these
+	// to affect kernel behavior in unimplemented ways (b/148380782).
+	if strings.HasPrefix(name, linux.XATTR_SYSTEM_PREFIX) {
+		return linuxerr.EOPNOTSUPP
+	}
+	// Disallow the "trusted" namespace because neither the gofer nor the sentry
+	// processes have the capability to set these. It requires CAP_SYS_ADMIN in
+	// the host's root user namespace.
+	if strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX) {
 		return linuxerr.EOPNOTSUPP
 	}
 	// Do not allow writes to the "security" namespace on the host filesystem.
 	if ats.MayWrite() && strings.HasPrefix(name, linux.XATTR_SECURITY_PREFIX) {
 		return linuxerr.EOPNOTSUPP
 	}
+	// Allow all other extended attributes to be passed through to remote.
 	mode := linux.FileMode(d.inode.mode.Load())
 	kuid := auth.KUID(d.inode.uid.Load())
 	kgid := auth.KGID(d.inode.gid.Load())
@@ -1938,7 +1943,15 @@ func (d *dentry) listXattr(ctx context.Context, size uint64) ([]string, error) {
 	if d.inode.isSynthetic() {
 		return nil, nil
 	}
-	return d.listXattrImpl(ctx, size)
+	if names, cached := d.inode.getCachedListXattr(); cached {
+		return names, nil
+	}
+	names, err := d.listXattrImpl(ctx, size)
+	if err != nil {
+		return nil, err
+	}
+	d.inode.cacheListXattr(names)
+	return names, nil
 }
 
 func (d *dentry) getXattr(ctx context.Context, creds *auth.Credentials, opts *vfs.GetXattrOptions) (string, error) {
@@ -1948,7 +1961,21 @@ func (d *dentry) getXattr(ctx context.Context, creds *auth.Credentials, opts *vf
 	if err := d.checkXattrPermissions(creds, opts.Name, vfs.MayRead); err != nil {
 		return "", err
 	}
-	return d.getXattrImpl(ctx, opts)
+	if val, negative, ok := d.inode.getCachedXattr(opts.Name); ok {
+		if negative {
+			return "", linuxerr.ENODATA
+		}
+		return val, nil
+	}
+	val, err := d.getXattrImpl(ctx, opts)
+	if err != nil {
+		if linuxerr.Equals(linuxerr.ENODATA, err) {
+			d.inode.cacheNegativeXattr(opts.Name)
+		}
+		return "", err
+	}
+	d.inode.cacheXattr(opts.Name, val)
+	return val, nil
 }
 
 func (d *dentry) setXattr(ctx context.Context, creds *auth.Credentials, opts *vfs.SetXattrOptions) error {
@@ -1958,7 +1985,11 @@ func (d *dentry) setXattr(ctx context.Context, creds *auth.Credentials, opts *vf
 	if err := d.checkXattrPermissions(creds, opts.Name, vfs.MayWrite); err != nil {
 		return err
 	}
-	return d.setXattrImpl(ctx, opts)
+	if err := d.setXattrImpl(ctx, opts); err != nil {
+		return err
+	}
+	d.inode.cacheXattr(opts.Name, opts.Value)
+	return nil
 }
 
 func (d *dentry) removeXattr(ctx context.Context, creds *auth.Credentials, name string) error {
@@ -1968,7 +1999,11 @@ func (d *dentry) removeXattr(ctx context.Context, creds *auth.Credentials, name 
 	if err := d.checkXattrPermissions(creds, name, vfs.MayWrite); err != nil {
 		return err
 	}
-	return d.inode.removeXattrImpl(ctx, name)
+	if err := d.removeXattrImpl(ctx, name); err != nil {
+		return err
+	}
+	d.inode.cacheNegativeXattr(name)
+	return nil
 }
 
 // Preconditions:
