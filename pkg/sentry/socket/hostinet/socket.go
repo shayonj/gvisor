@@ -52,6 +52,8 @@ const (
 )
 
 // AllowedSocketType is a tuple of socket family, type, and protocol.
+//
+// +stateify savable
 type AllowedSocketType struct {
 	Family int
 	Type   int
@@ -129,14 +131,18 @@ type Socket struct {
 	// masks, as when e.g. applications repeatedly call poll() with the same
 	// event mask, or blocking accept() / read() / write() / recvmsg() /
 	// sendmsg() / etc., on the same socket.
-	persistentEventMu   sync.Mutex
+	//
+	// persistentEventMu is nosave: the kernel is paused during save, so no
+	// goroutine holds the lock at that point, and the zero value is correct
+	// after restore.
+	persistentEventMu   sync.Mutex `state:"nosave"`
 	persistentEventMask atomicbitops.Uint64
 	persistentEntry     waiter.Entry
 
 	// fd is the host socket fd. It must have O_NONBLOCK, so that operations
 	// will return EWOULDBLOCK instead of blocking on the host. This allows us to
 	// handle blocking behavior independently in the sentry.
-	fd int
+	fd int `state:"nosave"`
 
 	// recvClosed indicates that the socket has been shutdown for reading
 	// (SHUT_RD or SHUT_RDWR).
@@ -175,6 +181,11 @@ func newSocket(t *kernel.Task, family int, stype linux.SockType, protocol int, f
 // Release implements vfs.FileDescriptionImpl.Release.
 func (s *Socket) Release(ctx context.Context) {
 	kernel.KernelFromContext(ctx).DeleteSocket(&s.vfsfd)
+	if s.fd < 0 {
+		// The host fd was already released by beforeSave and not
+		// re-established on restore. Nothing to do on the host side.
+		return
+	}
 	fdnotifier.RemoveFD(int32(s.fd))
 	_ = unix.Close(s.fd)
 }
@@ -303,11 +314,22 @@ func (p *socketProvider) Pair(t *kernel.Task, stype linux.SockType, protocol int
 
 // Readiness implements waiter.Waitable.Readiness.
 func (s *Socket) Readiness(mask waiter.EventMask) waiter.EventMask {
+	if s.fd < 0 {
+		return waiter.EventHUp | waiter.EventErr | waiter.EventRdHUp
+	}
 	return fdnotifier.NonBlockingPoll(int32(s.fd), mask)
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
 func (s *Socket) EventRegister(e *waiter.Entry) error {
+	// After restore the host fd has been released, so there is no host epoll
+	// registration to update. Add the entry to the queue so callers can still
+	// be notified by Notify() (e.g. the close events sent during beforeSave),
+	// but skip the fdnotifier path.
+	if s.fd < 0 {
+		s.queue.EventRegister(e)
+		return nil
+	}
 	if em, pem := e.Mask(), waiter.EventMask(s.persistentEventMask.Load()); em&^pem != 0 {
 		s.persistentEventMu.Lock()
 		pem = waiter.EventMask(s.persistentEventMask.RacyLoad())
@@ -344,6 +366,9 @@ func (s *Socket) EventUnregister(e *waiter.Entry) {
 // again in the future.
 func (s *Socket) eventRegisterTransient(e *waiter.Entry) error {
 	s.queue.EventRegister(e)
+	if s.fd < 0 {
+		return nil
+	}
 	if err := fdnotifier.UpdateFD(int32(s.fd)); err != nil {
 		s.queue.EventUnregister(e)
 		return err
@@ -355,6 +380,9 @@ func (s *Socket) eventRegisterTransient(e *waiter.Entry) error {
 // unregister notifiers registered by eventRegisterTransient.
 func (s *Socket) eventUnregisterTransient(e *waiter.Entry) {
 	s.queue.EventUnregister(e)
+	if s.fd < 0 {
+		return
+	}
 	if err := fdnotifier.UpdateFD(int32(s.fd)); err != nil {
 		panic(err)
 	}

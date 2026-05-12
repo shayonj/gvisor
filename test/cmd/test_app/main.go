@@ -51,6 +51,7 @@ func main() {
 	subcommands.Register(new(fsTreeCreator), "")
 	subcommands.Register(new(fsTreeVerify), "")
 	subcommands.Register(new(gvisorDetect), "")
+	subcommands.Register(new(hostinetSR), "")
 	subcommands.Register(new(ptyRunner), "")
 	subcommands.Register(new(reaper), "")
 	subcommands.Register(new(syscall), "")

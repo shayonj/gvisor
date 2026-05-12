@@ -49,6 +49,8 @@ var defaultSendBufSize = inet.TCPBufferSize{
 }
 
 // Stack implements inet.Stack for host sockets.
+//
+// +stateify savable
 type Stack struct {
 	// Stack is immutable.
 	supportsIPv6   bool
@@ -56,10 +58,22 @@ type Stack struct {
 	tcpRecvBufSize inet.TCPBufferSize
 	tcpSendBufSize inet.TCPBufferSize
 	tcpSACKEnabled bool
-	netDevFile     *os.File
-	netSNMPFile    *os.File
-	// allowedSocketTypes is the list of allowed socket types
-	allowedSocketTypes []AllowedSocketType
+
+	// configured is true once Configure has populated the host-derived fields.
+	// Configure is idempotent so it can be called again safely (e.g. from
+	// Loader.run() on the restore path, where ReplaceConfig has already
+	// installed valid values copied from a freshly-Configured fresh stack).
+	configured bool
+
+	// netDevFile and netSNMPFile are open file handles to /proc/net/dev and
+	// /proc/net/snmp on the host. They cannot be serialized; ReplaceConfig
+	// installs fresh handles from the post-restore host stack.
+	netDevFile  *os.File `state:"nosave"`
+	netSNMPFile *os.File `state:"nosave"`
+
+	// allowedSocketTypes is derived from the post-boot --net-raw config and is
+	// re-populated on restore by ReplaceConfig before the kernel resumes.
+	allowedSocketTypes []AllowedSocketType `state:"nosave"`
 }
 
 // Destroy implements inet.Stack.Destroy.
@@ -72,7 +86,13 @@ func NewStack() *Stack {
 }
 
 // Configure sets up the stack using the current state of the host network.
+// It is idempotent: subsequent calls return immediately so callers in
+// different code paths (fresh boot's Loader.run(), or createNetworkStackForRestore
+// on the restore path) can both invoke it without racing on /proc handles.
 func (s *Stack) Configure(allowRawSockets bool) error {
+	if s.configured {
+		return nil
+	}
 	if _, err := os.Stat("/proc/net/if_inet6"); err == nil {
 		s.supportsIPv6 = true
 	}
@@ -117,6 +137,7 @@ func (s *Stack) Configure(allowRawSockets bool) error {
 		s.allowedSocketTypes = append(s.allowedSocketTypes, AllowedRawSocketTypes...)
 	}
 
+	s.configured = true
 	return nil
 }
 
@@ -404,8 +425,25 @@ func (*Stack) Pause() {}
 // Restore implements inet.Stack.Restore.
 func (*Stack) Restore() {}
 
-// ReplaceConfig implements inet.Stack.ReplaceConfig.
-func (s *Stack) ReplaceConfig(_ inet.Stack) {}
+// ReplaceConfig implements inet.Stack.ReplaceConfig. It copies host-derived
+// configuration (proc file handles, buffer sizes, allowed socket types) from
+// the freshly-built post-boot stack into the deserialized stack so that
+// subsequent inet.Stack queries reflect the new host.
+func (s *Stack) ReplaceConfig(st inet.Stack) {
+	newStack, ok := st.(*Stack)
+	if !ok {
+		panic(fmt.Sprintf("hostinet.Stack cannot replace config from %T", st))
+	}
+	s.supportsIPv6 = newStack.supportsIPv6
+	s.tcpRecovery = newStack.tcpRecovery
+	s.tcpRecvBufSize = newStack.tcpRecvBufSize
+	s.tcpSendBufSize = newStack.tcpSendBufSize
+	s.tcpSACKEnabled = newStack.tcpSACKEnabled
+	s.netDevFile = newStack.netDevFile
+	s.netSNMPFile = newStack.netSNMPFile
+	s.allowedSocketTypes = newStack.allowedSocketTypes
+	s.configured = newStack.configured
+}
 
 // Resume implements inet.Stack.Resume.
 func (*Stack) Resume() {}

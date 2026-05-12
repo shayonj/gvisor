@@ -15,7 +15,6 @@
 package boot
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -170,10 +169,25 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo, containe
 }
 
 func createNetworkStackForRestore(l *Loader) inet.Stack {
-	// Save the current network stack to slap on top of the one that was restored.
+	// Return the current network stack so that the deserialized stack can
+	// absorb its host-derived configuration via ReplaceConfig.
 	curNetwork := l.k.RootNetworkNamespace().Stack()
 	if _, ok := curNetwork.(*netstack.Stack); ok {
 		return curNetwork
+	}
+	if h, ok := curNetwork.(*hostinet.Stack); ok {
+		// On a fresh boot, Loader.run() Configures the stack later (post-
+		// WaitForStartSignal). On the restore path that happens *after* the
+		// restorer installs seccomp filters, which would block openat on
+		// /proc/sys/net/ipv4/tcp_rmem etc., and after LoadFrom has already
+		// replaced the kernel's stack via ReplaceConfig. So we Configure
+		// here, before installSeccompFilters runs and before ReplaceConfig
+		// is given this stack, so the deserialized stack ends up with real
+		// host-derived buffer sizes / proc handles instead of zero values.
+		if err := h.Configure(l.root.conf.EnableRaw); err != nil {
+			log.Warningf("hostinet.Configure during restore: %v", err)
+		}
+		return h
 	}
 	return hostinet.NewStack()
 }
@@ -186,9 +200,8 @@ func (r *restorer) restore(l *Loader) error {
 	if err := specutils.RestoreValidateSpec(r.checkpointedSpecs, l.GetContainerSpecs(), l.root.conf); err != nil {
 		return fmt.Errorf("failed to handle restore spec validation: %w", err)
 	}
-	if l.root.conf.Network != config.NetworkSandbox && l.root.conf.Network != config.NetworkNone {
-		// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
-		return errors.New("checkpoint not supported when using hostinet")
+	if l.root.conf.Network != config.NetworkSandbox && l.root.conf.Network != config.NetworkNone && l.root.conf.Network != config.NetworkHost {
+		return fmt.Errorf("checkpoint not supported when using %s networking", l.root.conf.Network)
 	}
 	r.timer.Reached("specs validated")
 
@@ -473,11 +486,6 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRe
 		// This closure is required to capture the final value of err.
 		l.k.OnCheckpointAttempt(err)
 	}()
-
-	// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
-	if l.root.conf.Network == config.NetworkHost {
-		return errors.New("checkpoint not supported when using hostinet")
-	}
 
 	if saveOpts.Metadata == nil {
 		saveOpts.Metadata = make(map[string]string)

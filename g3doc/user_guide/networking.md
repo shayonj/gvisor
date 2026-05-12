@@ -42,6 +42,22 @@ Add the following `runtimeArgs` to your Docker configuration
 }
 ```
 
+### Checkpoint/restore with `--network=host`
+
+Sandboxes using `--network=host` can be checkpointed and restored. Because
+host file descriptors cannot cross a checkpoint boundary, any socket open at
+checkpoint time is closed unconditionally before the state file is written,
+and the application sees `EBADF` on the next operation against that socket
+(`read`, `write`, `accept`, `sendto`, `recvfrom`, etc.). `epoll_wait` returns
+immediately with `EPOLLERR | EPOLLHUP`, and includes `EPOLLRDHUP` if it was
+requested, so blocked tasks unblock cleanly. Applications are expected to
+detect the error and reconnect after restore. This applies even with
+`--leave-running`, because the kernel cannot keep two processes referencing
+the same host fd safely. Stack-level configuration (`/proc/net/{dev,snmp}`
+handles and TCP buffer sizes derived from `/proc/sys/net/ipv4/*`) is read from
+the post-restore host during restore, so workloads that query these via
+`/proc` see values from the new host rather than the checkpointed one.
+
 ## Disabling external networking
 
 To completely isolate the host and network from the sandbox, external networking

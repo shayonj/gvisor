@@ -21,6 +21,7 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"net"
 	"os"
 	"os/exec"
 	"path"
@@ -1321,6 +1322,245 @@ func TestCheckpointRestore(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCheckpointRestoreHostinet(t *testing.T) {
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatal("error finding test_app:", err)
+	}
+	target, stopServer := startHostinetSRServer(t)
+	defer stopServer()
+
+	for name, conf := range configs(t, true /* noOverlay */) {
+		conf.Network = config.NetworkHost
+		t.Run(name, func(t *testing.T) {
+			testCheckpointRestoreHostinet(t, conf, app, target)
+		})
+	}
+}
+
+func TestCheckpointResumeHostinet(t *testing.T) {
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatal("error finding test_app:", err)
+	}
+	target, stopServer := startHostinetSRServer(t)
+	defer stopServer()
+
+	for name, conf := range configs(t, true /* noOverlay */) {
+		conf.Network = config.NetworkHost
+		t.Run(name, func(t *testing.T) {
+			testCheckpointResumeHostinet(t, conf, app, target)
+		})
+	}
+}
+
+func testCheckpointRestoreHostinet(t *testing.T, conf *config.Config, app, target string) {
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("chmod %q: %v", dir, err)
+	}
+
+	logPath := filepath.Join(dir, "hostinet-sr.log")
+	spec := testutil.NewSpecWithArgs(app, "hostinet-sr", "--file", logPath, "--target", target)
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("SetupContainer: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer cont.Destroy()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := waitForHostinetSRLog(logPath, "SETUP_DONE", "TCP_WRITE OK", "UDP_WRITE OK", "EPOLL_WAIT TIMEOUT"); err != nil {
+		t.Fatalf("wait for setup: %v", err)
+	}
+	lastCount, err := lastHostinetSRCount(logPath)
+	if err != nil {
+		t.Fatalf("lastHostinetSRCount pre-restore: %v", err)
+	}
+
+	if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelFlateBestSpeed}); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+
+	args2 := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont2, err := New(conf, args2)
+	if err != nil {
+		t.Fatalf("New (restore): %v", err)
+	}
+	defer cont2.Destroy()
+	if err := cont2.Restore(conf, dir, false /* direct */, false /* background */); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if !cont2.Sandbox.Restored {
+		t.Fatalf("Sandbox.Restored = false, want true")
+	}
+
+	if err := waitForHostinetSRLog(logPath,
+		"TCP_WRITE ERRNO=9",
+		"TCP_READ ERRNO=9",
+		"BLOCKING_ACCEPT ERRNO=9",
+		"UDP_WRITE ERRNO=9",
+		"UDP_READ ERRNO=9",
+		"EPOLL_EVENT=0x18",
+		"NEW_TCP_WRITE OK"); err != nil {
+		t.Fatalf("wait for post-restore socket state: %v", err)
+	}
+	if err := waitForHostinetSRCountAfter(logPath, lastCount); err != nil {
+		t.Fatalf("wait for post-restore progress: %v", err)
+	}
+}
+
+func testCheckpointResumeHostinet(t *testing.T, conf *config.Config, app, target string) {
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("chmod %q: %v", dir, err)
+	}
+
+	logPath := filepath.Join(dir, "hostinet-sr.log")
+	spec := testutil.NewSpecWithArgs(app, "hostinet-sr", "--file", logPath, "--target", target)
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("SetupContainer: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer cont.Destroy()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := waitForHostinetSRLog(logPath, "SETUP_DONE", "TCP_WRITE OK", "UDP_WRITE OK", "EPOLL_WAIT TIMEOUT"); err != nil {
+		t.Fatalf("wait for setup: %v", err)
+	}
+	lastCount, err := lastHostinetSRCount(logPath)
+	if err != nil {
+		t.Fatalf("lastHostinetSRCount pre-checkpoint: %v", err)
+	}
+
+	if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{
+		Compression: statefile.CompressionLevelFlateBestSpeed,
+		Resume:      true,
+	}); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+
+	if err := waitForHostinetSRLog(logPath, "TCP_WRITE ERRNO=9", "NEW_TCP_WRITE OK"); err != nil {
+		t.Fatalf("wait for resumed socket state: %v", err)
+	}
+	if err := waitForHostinetSRCountAfter(logPath, lastCount); err != nil {
+		t.Fatalf("wait for resumed progress: %v", err)
+	}
+}
+
+func startHostinetSRServer(t *testing.T) (string, func()) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				io.Copy(io.Discard, c)
+			}()
+		}
+	}()
+	return ln.Addr().String(), func() {
+		ln.Close()
+		<-done
+	}
+}
+
+func waitForHostinetSRLog(path string, wants ...string) error {
+	return testutil.Poll(func() error {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		got := string(b)
+		for _, want := range wants {
+			if !strings.Contains(got, want) {
+				return fmt.Errorf("log missing %q in:\n%s", want, got)
+			}
+		}
+		return nil
+	}, 30*time.Second)
+}
+
+func waitForHostinetSRCountAfter(path string, prev int) error {
+	return testutil.Poll(func() error {
+		count, err := lastHostinetSRCount(path)
+		if err != nil {
+			return err
+		}
+		if count <= prev {
+			return fmt.Errorf("last COUNT=%d, want > %d", count, prev)
+		}
+		return nil
+	}, 30*time.Second)
+}
+
+func lastHostinetSRCount(path string) (int, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	last := -1
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(line, "COUNT=") {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimPrefix(line, "COUNT="))
+		if err != nil {
+			return 0, err
+		}
+		last = n
+	}
+	if last < 0 {
+		return 0, fmt.Errorf("no COUNT line in:\n%s", b)
+	}
+	return last, nil
 }
 
 // TestCheckpointRestoreExecKilled checks that exec'd processes are killed

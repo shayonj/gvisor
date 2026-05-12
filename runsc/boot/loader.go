@@ -1044,6 +1044,10 @@ func (l *Loader) run() error {
 	if l.root.conf.Network == config.NetworkHost {
 		// Delay host network configuration to this point because network namespace
 		// is configured after the loader is created and before Run() is called.
+		// Configure is idempotent, so on the restore path (where
+		// createNetworkStackForRestore has already Configured the fresh stack and
+		// ReplaceConfig has copied that state onto the deserialized stack) this
+		// is a no-op.
 		log.Debugf("Configuring host network")
 		s := l.k.RootNetworkNamespace().Stack().(*hostinet.Stack)
 		if err := s.Configure(l.root.conf.EnableRaw); err != nil {
