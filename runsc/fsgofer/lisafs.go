@@ -1037,6 +1037,13 @@ func (fd *controlFDLisa) GetXattr(name string, size uint32, getValueBuf func(uin
 		return uint16(xattrSize), err
 	}
 	xattrSize, err := unix.Fgetxattr(fd.hostFD, name, data)
+	if err == unix.EBADF {
+		// tryOpen falls back to O_PATH when O_RDONLY is denied (e.g., a
+		// directory whose mode is 0700 owned by a uid the gofer can't match).
+		// The host's fgetxattr(2) returns EBADF on O_PATH FDs, so reissue
+		// against the path.
+		xattrSize, err = unix.Lgetxattr(fd.Node().FilePath(), name, data)
+	}
 	return uint16(xattrSize), err
 }
 
@@ -1047,7 +1054,13 @@ func (fd *controlFDLisa) SetXattr(name string, value string, flags uint32) error
 		// with EBADF for O_PATH FDs. Use lsetxattr(2) instead.
 		return unix.Lsetxattr(fd.Node().FilePath(), name, []byte(value), int(flags))
 	}
-	return unix.Fsetxattr(fd.hostFD, name, []byte(value), int(flags))
+	if err := unix.Fsetxattr(fd.hostFD, name, []byte(value), int(flags)); err != nil {
+		if err == unix.EBADF {
+			return unix.Lsetxattr(fd.Node().FilePath(), name, []byte(value), int(flags))
+		}
+		return err
+	}
+	return nil
 }
 
 func (fd *controlFDLisa) listXattr(data []byte) (int, error) {
@@ -1056,7 +1069,12 @@ func (fd *controlFDLisa) listXattr(data []byte) (int, error) {
 		// with EBADF for O_PATH FDs. Use llistxattr(2) instead.
 		return unix.Llistxattr(fd.Node().FilePath(), data)
 	}
-	return unix.Flistxattr(fd.hostFD, data)
+	n, err := unix.Flistxattr(fd.hostFD, data)
+	if err == unix.EBADF {
+		// See GetXattr for why this fallback exists.
+		return unix.Llistxattr(fd.Node().FilePath(), data)
+	}
+	return n, err
 }
 
 var listXattrBufPool = sync.Pool{
@@ -1101,7 +1119,13 @@ func (fd *controlFDLisa) RemoveXattr(name string) error {
 		// with EBADF for O_PATH FDs. Use lremovexattr(2) instead.
 		return unix.Lremovexattr(fd.Node().FilePath(), name)
 	}
-	return unix.Fremovexattr(fd.hostFD, name)
+	if err := unix.Fremovexattr(fd.hostFD, name); err != nil {
+		if err == unix.EBADF {
+			return unix.Lremovexattr(fd.Node().FilePath(), name)
+		}
+		return err
+	}
+	return nil
 }
 
 // openFDLisa implements lisafs.OpenFDImpl.
