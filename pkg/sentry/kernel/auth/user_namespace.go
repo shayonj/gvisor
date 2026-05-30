@@ -20,6 +20,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/refs"
 )
 
 // A UserNamespace represents a user namespace. See user_namespaces(7) for
@@ -60,6 +61,9 @@ type UserNamespace struct {
 
 	// setgroupsAllowed mirrors USERNS_SETGROUPS_ALLOWED in Linux. Protected by mu.
 	setgroupsAllowed bool
+
+	// inode is the nsfs inode associated with this namespace.
+	inode refs.TryRefCounter
 }
 
 // NewRootUserNamespace returns a UserNamespace that is appropriate for a
@@ -97,6 +101,33 @@ func (ns *UserNamespace) Root() *UserNamespace {
 		ns = ns.parent
 	}
 	return ns
+}
+
+// Type implements vfs.Namespace.Type.
+func (ns *UserNamespace) Type() string {
+	return "user"
+}
+
+// Destroy implements vfs.Namespace.Destroy.
+func (ns *UserNamespace) Destroy(ctx context.Context) {}
+
+// UserNamespace implements vfs.Namespace.UserNamespace.
+func (ns *UserNamespace) UserNamespace() *UserNamespace {
+	return ns
+}
+
+// SetInode sets the nsfs inode associated with ns.
+func (ns *UserNamespace) SetInode(inode refs.TryRefCounter) {
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+	ns.inode = inode
+}
+
+// GetInode returns the nsfs inode associated with ns.
+func (ns *UserNamespace) GetInode() refs.TryRefCounter {
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+	return ns.inode
 }
 
 // "The kernel imposes (since version 3.11) a limit of 32 nested levels of user

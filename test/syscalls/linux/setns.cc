@@ -13,11 +13,13 @@
 // limitations under the License.
 
 #include <linux/prctl.h>
+#include <limits.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include <cstdint>
 
@@ -25,9 +27,11 @@
 #include "gtest/gtest.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "test/util/cleanup.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
+#include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/test_util.h"
 
@@ -154,6 +158,44 @@ TEST(SetnsTest, ChangeMountNamespaceZeroFlags) {
   const FileDescriptor nsfd =
       ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/thread-self/ns/mnt", O_RDONLY));
   ASSERT_THAT(setns(nsfd.get(), 0), SyscallSucceedsWithValue(0));
+}
+
+TEST(SetnsTest, ChangeUserNamespace) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  int pfd[2];
+  ASSERT_THAT(pipe(pfd), SyscallSucceeds());
+  FileDescriptor pipe_read(pfd[0]);
+  FileDescriptor pipe_write(pfd[1]);
+
+  pid_t child = fork();
+  ASSERT_THAT(child, SyscallSucceeds());
+  if (child == 0) {
+    pipe_read.reset();
+    TEST_CHECK_SUCCESS(unshare(CLONE_NEWUSER));
+    TEST_CHECK_SUCCESS(write(pipe_write.get(), "R", 1));
+    pause();
+    _exit(0);
+  }
+  Cleanup cleanup([child] {
+    kill(child, SIGKILL);
+    kill(child, SIGCONT);
+    int status;
+    RetryEINTR(waitpid)(child, &status, 0);
+  });
+  pipe_write.reset();
+
+  char buf;
+  ASSERT_THAT(read(pipe_read.get(), &buf, 1), SyscallSucceedsWithValue(1));
+
+  char nspath[PATH_MAX];
+  snprintf(nspath, sizeof(nspath), "/proc/%d/ns/user", child);
+  const FileDescriptor nsfd = ASSERT_NO_ERRNO_AND_VALUE(Open(nspath, O_RDONLY));
+
+  EXPECT_THAT(InForkedProcess([&nsfd] {
+                TEST_CHECK_SUCCESS(setns(nsfd.get(), CLONE_NEWUSER));
+              }),
+              IsPosixErrorOkAndHolds(0));
 }
 
 }  // namespace
