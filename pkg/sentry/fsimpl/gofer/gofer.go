@@ -1000,6 +1000,12 @@ type inode struct {
 	// tracks dirty segments in cache. dirty is protected by dataMu.
 	dirty fsutil.DirtySet
 
+	// readahead tracks the most recent page cache fill for this inode, so mappings
+	// and cached reads share the hint. It is protected by dataMu.
+	// InvalidateUnsavable discards cache before checkpoint, so the hint is not
+	// saved.
+	readahead readaheadWindow `state:"nosave"`
+
 	// If this inode represents a deleted regular file, savedDeletedData is used
 	// to store file data for save/restore.
 	savedDeletedData []byte

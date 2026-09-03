@@ -78,6 +78,7 @@ go_library(
         "inode_impl.go",
         "inode_refs.go",
         "lisafs_inode.go",
+        "readahead.go",
         "regular_file.go",
         "revalidate.go",
         "save_restore.go",
@@ -138,13 +139,17 @@ go_library(
 
 go_test(
     name = "gofer_test",
-    srcs = ["gofer_test.go"],
+    srcs = [
+        "gofer_test.go",
+        "readahead_test.go",
+    ],
     library = ":gofer",
     deps = [
         "//pkg/abi/linux",
         "//pkg/lisafs",
         "//pkg/sentry/contexttest",
         "//pkg/sentry/ktime",
+        "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
     ],
 )
