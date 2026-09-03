@@ -431,7 +431,7 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 					End:   gapEnd,
 				}
 				optMR := gap.Range()
-				_, err := rw.d.inode.cache.Fill(rw.ctx, reqMR, maxFillRange(reqMR, optMR), rw.d.inode.size.Load(), mf, pgalloc.AllocOpts{
+				_, err := rw.d.inode.cache.Fill(rw.ctx, reqMR, rw.d.inode.fillRange(reqMR, optMR), rw.d.inode.size.Load(), mf, pgalloc.AllocOpts{
 					Kind:    usage.PageCache,
 					MemCgID: memCgID,
 					Mode:    pgalloc.AllocateAndWritePopulate,
@@ -781,7 +781,7 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 
 	mf := d.inode.fs.mf
 	h := d.inode.readHandle()
-	_, cerr := d.inode.cache.Fill(ctx, required, maxFillRange(required, optional), d.inode.size.Load(), mf, pgalloc.AllocOpts{
+	_, cerr := d.inode.cache.Fill(ctx, required, d.inode.fillRange(required, optional), d.inode.size.Load(), mf, pgalloc.AllocOpts{
 		Kind:    usage.PageCache,
 		MemCgID: memCgID,
 		Mode:    pgalloc.AllocateAndWritePopulate,

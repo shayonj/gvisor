@@ -1000,6 +1000,10 @@ type inode struct {
 	// tracks dirty segments in cache. dirty is protected by dataMu.
 	dirty fsutil.DirtySet
 
+	// ra is the window of the most recent fill of cache. ra is protected by
+	// dataMu.
+	ra readahead
+
 	// If this inode represents a deleted regular file, savedDeletedData is used
 	// to store file data for save/restore.
 	savedDeletedData []byte
