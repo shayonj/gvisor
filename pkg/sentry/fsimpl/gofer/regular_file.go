@@ -538,23 +538,59 @@ func (rw *dentryReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, erro
 			seg, gap = seg.NextNonEmpty()
 
 		case gap.Ok():
-			// Write directly to the file. At present, we never fill the cache
-			// when writing, since doing so can convert small writes into
-			// inefficient read-modify-write cycles, and we have no mechanism
-			// for detecting or avoiding this.
 			gapMR := gap.Range().Intersect(mr)
-			gapSrcs := srcs.TakeFirst64(gapMR.Length())
-			n, err := h.writeFromBlocksAt(rw.ctx, gapSrcs, gapMR.Start)
-			done += n
-			rw.off += n
-			srcs = srcs.DropFirst64(n)
-			// Partial writes are fine. But we must stop writing.
-			if n != gapSrcs.NumBytes() || err != nil {
-				retErr = err
-				goto exitLoop
+			// Keep partial pages on the direct path. A full page is safe to
+			// materialize without a read because every byte in it is overwritten
+			// by this write.
+			fullStart, fullStartOK := hostarch.PageRoundUp(gapMR.Start)
+			if !fullStartOK {
+				fullStart = math.MaxInt64
 			}
-
-			// Continue.
+			fullEnd := hostarch.PageRoundDown(gapMR.End)
+			if gapMR.Start < fullStart {
+				directEnd := fullStart
+				if directEnd > gapMR.End {
+					directEnd = gapMR.End
+				}
+				directMR := memmap.MappableRange{Start: gapMR.Start, End: directEnd}
+				gapSrcs := srcs.TakeFirst64(directMR.Length())
+				n, err := h.writeFromBlocksAt(rw.ctx, gapSrcs, directMR.Start)
+				done += n
+				rw.off += n
+				srcs = srcs.DropFirst64(n)
+				if n != gapSrcs.NumBytes() || err != nil {
+					retErr = err
+					goto exitLoop
+				}
+				seg, gap = rw.d.inode.cache.Find(rw.off)
+				continue
+			}
+			if rw.off < fullEnd {
+				cacheMR := memmap.MappableRange{Start: rw.off, End: fullEnd}
+				_, err := rw.d.inode.cache.Fill(rw.ctx, cacheMR, cacheMR, rw.d.inode.size.Load(), mf, pgalloc.AllocOpts{
+					Kind:    usage.PageCache,
+					MemCgID: pgalloc.MemoryCgroupIDFromContext(rw.ctx),
+					Mode:    pgalloc.AllocateAndWritePopulate,
+				}, nil)
+				if err != nil {
+					retErr = err
+					goto exitLoop
+				}
+				seg, gap = rw.d.inode.cache.Find(rw.off)
+				continue
+			}
+			if rw.off < gapMR.End {
+				directMR := memmap.MappableRange{Start: rw.off, End: gapMR.End}
+				gapSrcs := srcs.TakeFirst64(directMR.Length())
+				n, err := h.writeFromBlocksAt(rw.ctx, gapSrcs, directMR.Start)
+				done += n
+				rw.off += n
+				srcs = srcs.DropFirst64(n)
+				if n != gapSrcs.NumBytes() || err != nil {
+					retErr = err
+					goto exitLoop
+				}
+			}
 			seg, gap = gap.NextSegment(), fsutil.FileRangeGapIterator{}
 		}
 	}
