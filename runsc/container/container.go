@@ -1470,7 +1470,7 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 		if !c.GoferMountConfs[0].ShouldUseErofs() {
 			panic("goferless mode is only possible with EROFS rootfs")
 		}
-		ioFile, err := os.Open(rootfsHint.Mount.Source)
+		ioFile, err := openErofsRoot(rootfsHint)
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("opening rootfs image %q: %v", rootfsHint.Mount.Source, err)
 		}
@@ -1619,7 +1619,7 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 		}
 
 	case c.GoferMountConfs[0].ShouldUseErofs():
-		f, err := os.Open(rootfsHint.Mount.Source)
+		f, err := openErofsRoot(rootfsHint)
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("opening rootfs image %q: %v", rootfsHint.Mount.Source, err)
 		}
@@ -2492,4 +2492,26 @@ func (c *Container) GetNetworkConfig() (*boot.CreateLinksAndRoutesArgs, error) {
 		return nil, err
 	}
 	return c.Sandbox.GetNetworkConfig()
+}
+
+func openErofsRoot(hint *boot.RootfsHint) (*os.File, error) {
+	if hint.Transport != "unix" {
+		return os.Open(hint.Mount.Source)
+	}
+	socket, err := unet.Connect(hint.Mount.Source, true)
+	if err != nil {
+		return nil, err
+	}
+	if hint.Image != "" {
+		if n, err := socket.Write([]byte(hint.Image)); err != nil || n != len(hint.Image) {
+			socket.Close()
+			return nil, fmt.Errorf("select erofs image: %d, %v", n, err)
+		}
+	}
+	fd, err := socket.Release()
+	if err != nil {
+		socket.Close()
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), "erofs image source"), nil
 }

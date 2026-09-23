@@ -4,7 +4,6 @@ package erofs
 
 import (
 	"context"
-
 	"gvisor.dev/gvisor/pkg/state"
 )
 
@@ -405,6 +404,7 @@ func (mf *imageMemmapFile) StateFields() []string {
 		"DefaultMemoryType",
 		"NoBufferedIOFallback",
 		"image",
+		"device",
 	}
 }
 
@@ -416,6 +416,7 @@ func (mf *imageMemmapFile) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &mf.DefaultMemoryType)
 	stateSinkObject.Save(1, &mf.NoBufferedIOFallback)
 	stateSinkObject.Save(2, &mf.image)
+	stateSinkObject.Save(3, &mf.device)
 }
 
 func (mf *imageMemmapFile) afterLoad(context.Context) {}
@@ -425,6 +426,7 @@ func (mf *imageMemmapFile) StateLoad(ctx context.Context, stateSourceObject stat
 	stateSourceObject.Load(0, &mf.DefaultMemoryType)
 	stateSourceObject.Load(1, &mf.NoBufferedIOFallback)
 	stateSourceObject.Load(2, &mf.image)
+	stateSourceObject.Load(3, &mf.device)
 }
 
 func init() {

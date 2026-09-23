@@ -82,7 +82,7 @@ type filesystem struct {
 	image *erofs.Image
 
 	// mf implements memmap.File for this image.
-	mf imageMemmapFile
+	mf [256]imageMemmapFile
 
 	// useReadForIO indicates that file I/O should be driven by read syscalls
 	// from the image file descriptor instead of the image mapping.
@@ -169,8 +169,10 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		image:             image,
 		devMinor:          devMinor,
 		useReadForIO:      useReadForIO,
-		mf:                imageMemmapFile{image: image},
 		maxCachedDentries: defaultMaxCachedDentries,
+	}
+	for device := range fs.mf {
+		fs.mf[device] = imageMemmapFile{image: image, device: uint16(device)}
 	}
 	fs.vfsfs.Init(vfsObj, &fstype, fs)
 	cu.Add(func() { fs.vfsfs.DecRef(ctx) })
@@ -854,3 +856,19 @@ func (*fileDescription) Sync(context.Context, vfs.SyncOptions) error {
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (*fileDescription) Release(ctx context.Context) {}
+
+// PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
+func (fs *filesystem) PrepareSave(ctx context.Context) error {
+	if fs.image.HasRemoteSource() {
+		return linuxerr.EOPNOTSUPP
+	}
+	return nil
+}
+
+// BeforeResume implements vfs.FilesystemImplSaveRestoreExtension.BeforeResume.
+func (fs *filesystem) BeforeResume(ctx context.Context) {}
+
+// CompleteRestore implements vfs.FilesystemImplSaveRestoreExtension.CompleteRestore.
+func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRestoreOptions) error {
+	return nil
+}

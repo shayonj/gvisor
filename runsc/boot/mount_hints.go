@@ -261,8 +261,10 @@ func (p *PodMountHints) FindMount(mountSrc string) *MountHint {
 // RootfsHint represents extra information about rootfs that are provided via
 // annotations. They can provide mount source, mount type and overlay config.
 type RootfsHint struct {
-	Mount   specs.Mount
-	Overlay config.OverlayMedium
+	Transport string
+	Image     string
+	Mount     specs.Mount
+	Overlay   config.OverlayMedium
 	// Size of overlay tmpfs. Passed as `size={Size}` to tmpfs mount.
 	// Use default if unspecified.
 	Size string
@@ -292,6 +294,16 @@ func (r *RootfsHint) setOption(key, val string) error {
 	switch key {
 	case "size":
 		r.Size = val
+	case "image":
+		if len(val) != 64 || strings.Trim(val, "0123456789abcdef") != "" {
+			return fmt.Errorf("invalid rootfs image digest %q", val)
+		}
+		r.Image = val
+	case "transport":
+		if val != "unix" {
+			return fmt.Errorf("unsupported rootfs transport %q", val)
+		}
+		r.Transport = val
 	default:
 		return fmt.Errorf("invalid rootfs option: %s=%s", key, val)
 	}

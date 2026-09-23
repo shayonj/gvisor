@@ -61,6 +61,9 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	}
 
 	inode := fd.inode()
+	if inode.DataLayout() == erofs.InodeDataLayoutChunkBased {
+		return dst.CopyOutFrom(ctx, &chunkFileReader{inode: inode, off: uint64(offset)})
+	}
 	ranges, err := inode.DataRanges()
 	if err != nil {
 		return 0, err
@@ -72,6 +75,33 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		useRead: inode.fs.useReadForIO,
 	}
 	return dst.CopyOutFrom(ctx, r)
+}
+
+type chunkFileReader struct {
+	inode *inode
+	off   uint64
+}
+
+func (r *chunkFileReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
+	if r.off >= r.inode.Size() {
+		return 0, io.EOF
+	}
+	rng, err := r.inode.DataRangeAt(r.off)
+	if err != nil {
+		return 0, err
+	}
+	size := min(rng.Size, r.inode.Size()-r.off, dsts.NumBytes(), uint64(64<<10)-rng.Off%hostarch.PageSize)
+	device, offset, err := r.inode.fs.image.ResolveRange(rng.Off, size)
+	if err != nil {
+		return 0, err
+	}
+	data, err := r.inode.fs.image.DeviceBytes(device, offset, size)
+	if err != nil {
+		return 0, err
+	}
+	n, err := safemem.CopySeq(dsts.TakeFirst64(size), safemem.BlockSeqOf(safemem.BlockFromSafeSlice(data)))
+	r.off += n
+	return n, err
 }
 
 type regularFileReader struct {
@@ -197,6 +227,31 @@ func (i *inode) Translate(ctx context.Context, required, optional memmap.Mappabl
 		})
 		return nil, &memmap.BusError{linuxerr.EROFS}
 	}
+	if i.DataLayout() == erofs.InodeDataLayoutChunkBased {
+		var translations []memmap.Translation
+		for start := required.Start; start < required.End; {
+			rng, err := i.DataRangeAt(start)
+			if err != nil {
+				return translations, &memmap.BusError{err}
+			}
+			end := min(start+rng.Size, optional.End, start+64<<10)
+			device, offset, err := i.fs.image.ResolveRange(rng.Off, end-start)
+			if err != nil {
+				return translations, &memmap.BusError{err}
+			}
+			if _, err := i.fs.image.DeviceBytes(device, offset, end-start); err != nil {
+				return translations, &memmap.BusError{err}
+			}
+			translations = append(translations, memmap.Translation{
+				Source: memmap.MappableRange{Start: start, End: end},
+				File:   &i.fs.mf[device],
+				Offset: offset,
+				Perms:  hostarch.ReadExecute,
+			})
+			start = end
+		}
+		return translations, nil
+	}
 	offset, err := i.DataOffset()
 	if err != nil {
 		return nil, &memmap.BusError{err}
@@ -205,7 +260,7 @@ func (i *inode) Translate(ctx context.Context, required, optional memmap.Mappabl
 	return []memmap.Translation{
 		{
 			Source: mr,
-			File:   &i.fs.mf,
+			File:   &i.fs.mf[0],
 			Offset: mr.Start + offset,
 			Perms:  hostarch.ReadExecute,
 		},
@@ -227,7 +282,8 @@ type imageMemmapFile struct {
 	memmap.DefaultMemoryType
 	memmap.NoBufferedIOFallback
 
-	image *erofs.Image
+	image  *erofs.Image
+	device uint16
 }
 
 // IncRef implements memmap.File.IncRef.
@@ -241,7 +297,7 @@ func (mf *imageMemmapFile) MapInternal(fr memmap.FileRange, at hostarch.AccessTy
 	if at.Write {
 		return safemem.BlockSeq{}, &memmap.BusError{linuxerr.EROFS}
 	}
-	bytes, err := mf.image.BytesAt(fr.Start, fr.Length())
+	bytes, err := mf.image.DeviceBytes(mf.device, fr.Start, fr.Length())
 	if err != nil {
 		return safemem.BlockSeq{}, &memmap.BusError{err}
 	}
@@ -255,5 +311,5 @@ func (mf *imageMemmapFile) DataFD(fr memmap.FileRange) (int, error) {
 
 // FD implements memmap.File.FD.
 func (mf *imageMemmapFile) FD() int {
-	return mf.image.FD()
+	return mf.image.DeviceFD(mf.device)
 }

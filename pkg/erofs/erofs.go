@@ -24,8 +24,10 @@ package erofs
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"math/bits"
 	"os"
 
 	"golang.org/x/sys/unix"
@@ -89,7 +91,9 @@ const (
 //
 // This is not exhaustive, unused features are not listed.
 const (
-	FeatureIncompatSupported = 0x0
+	FeatureIncompatChunkedFile = 0x4
+	FeatureIncompatDeviceTable = 0x8
+	FeatureIncompatSupported   = FeatureIncompatChunkedFile | FeatureIncompatDeviceTable
 )
 
 // Sizes of on-disk structures in bytes.
@@ -204,21 +208,29 @@ func (d *Dirent) Nid() uint64 {
 //
 // +stateify savable
 type Image struct {
-	src   *os.File `state:"nosave"`
-	bytes []byte   `state:"nosave"`
-	sb    SuperBlock
+	src    *os.File `state:"nosave"`
+	bytes  []byte   `state:"nosave"`
+	sb     SuperBlock
+	remote *remoteImage `state:"nosave"`
 }
 
 // OpenImage returns an Image providing access to the contents in the image file src.
 //
 // On success, the ownership of src is transferred to Image.
 func OpenImage(src *os.File) (*Image, error) {
+	stat, err := src.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if stat.Mode()&os.ModeSocket != 0 {
+		return openRemoteImage(src)
+	}
 	i := &Image{src: src}
 
 	var cu cleanup.Cleanup
 	defer cu.Clean()
 
-	stat, err := i.src.Stat()
+	stat, err = i.src.Stat()
 	if err != nil {
 		return nil, err
 	}
@@ -237,6 +249,9 @@ func OpenImage(src *os.File) (*Image, error) {
 
 // Close closes the image.
 func (i *Image) Close() {
+	if i.remote != nil {
+		i.remote.close()
+	}
 	unix.Munmap(i.bytes)
 	i.src.Close()
 }
@@ -492,6 +507,23 @@ func (i *Image) Inode(nid uint64) (Inode, error) {
 	case InodeDataLayoutFlatPlain:
 		inode.dataOff = i.sb.BlockAddrToOffset(rawBlockAddr)
 
+	case InodeDataLayoutChunkBased:
+		if !inode.IsRegular() || rawBlockAddr & ^uint32(0x3f) != 0 || rawBlockAddr&0x20 == 0 {
+			return Inode{}, linuxerr.ENOTSUP
+		}
+		if i.sb.FeatureIncompat&FeatureIncompatChunkedFile == 0 {
+			return Inode{}, linuxerr.EUCLEAN
+		}
+		inode.chunkBits = uint8(rawBlockAddr&0x1f) + i.sb.BlockSizeBits
+		inode.dataOff = (off + uint64(inodeSize) + 7) &^ 7
+		chunkCount := (inode.size >> inode.chunkBits)
+		if inode.size&((uint64(1)<<inode.chunkBits)-1) != 0 {
+			chunkCount++
+		}
+		if chunkCount != 0 && !i.checkRange(inode.dataOff, chunkCount*8) {
+			return Inode{}, linuxerr.EUCLEAN
+		}
+
 	default:
 		log.Warningf("Unsupported data layout 0x%x at inode (nid=%v)", dataLayout, nid)
 		return Inode{}, linuxerr.ENOTSUP
@@ -521,7 +553,8 @@ type Inode struct {
 	blocks uint64
 
 	// format is the format of this inode.
-	format uint16
+	format    uint16
+	chunkBits uint8
 
 	// Metadata.
 	mode      uint16
@@ -622,6 +655,54 @@ func (i *Inode) UID() uint32 {
 // GID returns the group ID of the owner.
 func (i *Inode) GID() uint32 {
 	return i.gid
+}
+
+// DataRangeAt returns the contiguous backing range beginning at a file offset.
+// The final chunk includes zero padding up to the filesystem block boundary.
+func (i *Inode) DataRangeAt(offset uint64) (FileRange, error) {
+	if i.DataLayout() != InodeDataLayoutChunkBased {
+		dataOffset, err := i.DataOffset()
+		if err != nil {
+			return FileRange{}, err
+		}
+		end, ok := hostarch.PageRoundUp(i.size)
+		if !ok || offset >= end {
+			return FileRange{}, linuxerr.EINVAL
+		}
+		return FileRange{Off: dataOffset + offset, Size: end - offset}, nil
+	}
+	end, ok := hostarch.PageRoundUp(i.size)
+	if !ok || offset >= end {
+		return FileRange{}, linuxerr.EINVAL
+	}
+	chunkSize := uint64(1) << i.chunkBits
+	index := offset >> i.chunkBits
+	entry, err := i.image.BytesAt(i.dataOff+index*8, 8)
+	if err != nil {
+		return FileRange{}, err
+	}
+	deviceMask := uint16((uint32(1) << bits.Len16(i.image.sb.ExtraDevices)) - 1)
+	device := binary.LittleEndian.Uint16(entry[2:4]) & deviceMask
+	block := binary.LittleEndian.Uint32(entry[4:8])
+	if device > i.image.sb.ExtraDevices || block == ^uint32(0) {
+		return FileRange{}, linuxerr.EUCLEAN
+	}
+	base := uint64(0)
+	if device != 0 {
+		slot := uint64(i.image.sb.DevTableSlotOff)*128 + uint64(device-1)*128
+		info, err := i.image.BytesAt(slot, 128)
+		if err != nil {
+			return FileRange{}, err
+		}
+		blocks := binary.LittleEndian.Uint32(info[64:68])
+		if block >= blocks {
+			return FileRange{}, linuxerr.EUCLEAN
+		}
+		base = i.image.sb.BlockAddrToOffset(binary.LittleEndian.Uint32(info[68:72]))
+	}
+	within := offset & (chunkSize - 1)
+	size := min(chunkSize-within, end-offset)
+	return FileRange{Off: base + i.image.sb.BlockAddrToOffset(block) + within, Size: size}, nil
 }
 
 // DataOffset returns the data offset of this inode in image file.
