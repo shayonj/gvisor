@@ -52,7 +52,7 @@ func openRemoteImage(source *os.File) (*Image, error) {
 		return nil, err
 	}
 	r := &remoteImage{socket: socket, files: make(map[uint16]*deviceFile)}
-	metadata, err := r.request(0, 0, 0)
+	metadata, _, _, err := r.request(0, 0, 0)
 	if err != nil {
 		socket.Close()
 		return nil, err
@@ -79,7 +79,7 @@ func openRemoteImage(source *os.File) (*Image, error) {
 	return image, nil
 }
 
-func (r *remoteImage) request(device uint16, offset, length uint64) (*os.File, error) {
+func (r *remoteImage) request(device uint16, offset, length uint64) (*os.File, uint64, uint64, error) {
 	timedOut := make(chan struct{})
 	deadline := time.AfterFunc(30*time.Second, func() {
 		r.socket.Shutdown()
@@ -95,26 +95,26 @@ func (r *remoteImage) request(device uint16, offset, length uint64) (*os.File, e
 	binary.LittleEndian.PutUint64(request[8:16], offset)
 	binary.LittleEndian.PutUint64(request[16:], length)
 	if n, err := r.socket.Write(request[:]); err != nil || n != len(request) {
-		return nil, fmt.Errorf("erofs source write: %d, %v", n, err)
+		return nil, 0, 0, fmt.Errorf("erofs source write: %d, %v", n, err)
 	}
 	reader := r.socket.Reader(true)
 	reader.EnableFDs(1)
-	var response [8]byte
+	var response [24]byte
 	n, err := reader.ReadVec([][]byte{response[:]})
 	defer reader.CloseFDs()
-	if err != nil || n != len(response) || binary.LittleEndian.Uint64(response[:]) != 0 {
-		return nil, fmt.Errorf("erofs source response: %d, %v", n, err)
+	if err != nil || n != len(response) || binary.LittleEndian.Uint64(response[:8]) != 0 {
+		return nil, 0, 0, fmt.Errorf("erofs source response: %d, %v", n, err)
 	}
 	fds, err := reader.ExtractFDs()
 	if err != nil || len(fds) != 1 {
-		return nil, linuxerr.EIO
+		return nil, 0, 0, linuxerr.EIO
 	}
 	flags, err := unix.FcntlInt(uintptr(fds[0]), unix.F_GETFL, 0)
 	if err != nil || flags&unix.O_ACCMODE != unix.O_RDONLY {
-		return nil, linuxerr.EACCES
+		return nil, 0, 0, linuxerr.EACCES
 	}
 	reader.UnpackFDs()
-	return os.NewFile(uintptr(fds[0]), "erofs device"), nil
+	return os.NewFile(uintptr(fds[0]), "erofs device"), binary.LittleEndian.Uint64(response[8:16]), binary.LittleEndian.Uint64(response[16:]), nil
 }
 
 func (r *remoteImage) close() {
@@ -176,9 +176,13 @@ func (r *remoteImage) resolve(device uint16, offset, length, size uint64) error 
 			return nil
 		}
 	}
-	fd, err := r.request(device, first*hostarch.PageSize, (last-first+1)*hostarch.PageSize)
+	fd, start, end, err := r.request(device, first*hostarch.PageSize, (last-first+1)*hostarch.PageSize)
 	if err != nil {
 		return err
+	}
+	if start > first*hostarch.PageSize || end < (last+1)*hostarch.PageSize || end > size {
+		fd.Close()
+		return linuxerr.EIO
 	}
 	if file == nil {
 		stat, err := fd.Stat()
@@ -201,7 +205,7 @@ func (r *remoteImage) resolve(device uint16, offset, length, size uint64) error 
 			return linuxerr.EIO
 		}
 	}
-	for page := first; page <= last; page++ {
+	for page := (start + hostarch.PageSize - 1) / hostarch.PageSize; page < end/hostarch.PageSize; page++ {
 		file.ready[page/64] |= uint64(1) << (page % 64)
 	}
 	return nil
