@@ -25,7 +25,7 @@ import (
 
 func TestRemoteBackingIdentity(t *testing.T) {
 	for _, replace := range []bool{false, true} {
-		t.Run(map[bool]string{false: "same backing", true: "replaced backing"}[replace], func(t *testing.T) {
+		t.Run(map[bool]string{false: "same backing through legacy replies", true: "replaced backing"}[replace], func(t *testing.T) {
 			client, server, err := unet.SocketPair(true)
 			if err != nil {
 				t.Fatal(err)
@@ -66,7 +66,11 @@ func TestRemoteBackingIdentity(t *testing.T) {
 					}
 					writer := server.Writer(true)
 					writer.PackFDs(int(file.Fd()))
-					if _, err := writer.WriteVec([][]byte{rangeResponse(request[:])}); err != nil {
+					response := rangeResponse(request[:])
+					if !replace {
+						response = response[:8]
+					}
+					if _, err := writer.WriteVec([][]byte{response}); err != nil {
 						result <- err
 						return
 					}

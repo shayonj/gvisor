@@ -102,7 +102,7 @@ func (r *remoteImage) request(device uint16, offset, length uint64) (*os.File, u
 	var response [24]byte
 	n, err := reader.ReadVec([][]byte{response[:]})
 	defer reader.CloseFDs()
-	if err != nil || n != len(response) || binary.LittleEndian.Uint64(response[:8]) != 0 {
+	if err != nil || (n != 8 && n != len(response)) || binary.LittleEndian.Uint64(response[:8]) != 0 {
 		return nil, 0, 0, fmt.Errorf("erofs source response: %d, %v", n, err)
 	}
 	fds, err := reader.ExtractFDs()
@@ -114,6 +114,9 @@ func (r *remoteImage) request(device uint16, offset, length uint64) (*os.File, u
 		return nil, 0, 0, linuxerr.EACCES
 	}
 	reader.UnpackFDs()
+	if n == 8 {
+		return os.NewFile(uintptr(fds[0]), "erofs device"), offset, offset + length, nil
+	}
 	return os.NewFile(uintptr(fds[0]), "erofs device"), binary.LittleEndian.Uint64(response[8:16]), binary.LittleEndian.Uint64(response[16:]), nil
 }
 

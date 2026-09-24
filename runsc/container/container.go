@@ -17,6 +17,7 @@ package container
 
 import (
 	"bufio"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -2503,6 +2504,38 @@ func openErofsRoot(hint *boot.RootfsHint) (*os.File, error) {
 		return nil, err
 	}
 	if hint.Image != "" {
+		selection := make([]byte, len(hint.Image)+8)
+		copy(selection, hint.Image)
+		binary.LittleEndian.PutUint64(selection[len(hint.Image):], 2)
+		if n, err := socket.Write(selection); err != nil || n != len(selection) {
+			socket.Close()
+			return nil, fmt.Errorf("negotiate erofs image: %d, %v", n, err)
+		}
+		timedOut := make(chan struct{})
+		deadline := time.AfterFunc(30*time.Second, func() { socket.Shutdown(); close(timedOut) })
+		var version [8]byte
+		n, readErr := socket.Read(version[:])
+		if !deadline.Stop() {
+			<-timedOut
+			socket.Close()
+			return nil, fmt.Errorf("erofs negotiation timed out")
+		}
+		if readErr == nil && n == len(version) && binary.LittleEndian.Uint64(version[:]) == 2 {
+			fd, err := socket.Release()
+			if err != nil {
+				socket.Close()
+				return nil, err
+			}
+			return os.NewFile(uintptr(fd), "erofs image source"), nil
+		}
+		socket.Close()
+		if n != 0 {
+			return nil, fmt.Errorf("unsupported erofs range protocol")
+		}
+		socket, err = unet.Connect(hint.Mount.Source, true)
+		if err != nil {
+			return nil, err
+		}
 		if n, err := socket.Write([]byte(hint.Image)); err != nil || n != len(hint.Image) {
 			socket.Close()
 			return nil, fmt.Errorf("select erofs image: %d, %v", n, err)
