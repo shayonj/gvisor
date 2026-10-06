@@ -118,7 +118,9 @@ func TestSaveToPreservesContents(t *testing.T) {
 			f := newSaveTestMemoryFile(t, tc.diskBacked)
 			fr := allocateSaveTestPages(t, f)
 			pwritePage(t, f, fr, 2, 1)
-			pwritePage(t, f, fr, 13, 2)
+			f.forEachMappingSlice(memmap.FileRange{fr.Start + 13*hostarch.PageSize, fr.Start + 14*hostarch.PageSize}, func(bs []byte) {
+				bs[17] = 2
+			})
 			if err := f.SaveTo(context.Background(), io.Discard, &SaveOpts{}); err != nil {
 				t.Fatalf("first SaveTo: %v", err)
 			}
