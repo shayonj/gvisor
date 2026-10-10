@@ -7,7 +7,10 @@ package(
 
 go_library(
     name = "precompiledseccomp",
-    srcs = ["precompiledseccomp.go"],
+    srcs = [
+        "library.go",
+        "precompiledseccomp.go",
+    ],
     importpath = "gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp",
     visibility = ["//:sandbox"],
     deps = [
@@ -19,14 +22,12 @@ go_library(
 
 # @unused
 glaze_ignore = [
-    "precompiled_lib.tmpl.go",
     "precompile_gen.go",
 ]
 
 exports_files(
     srcs = [
         "precompile_gen.go",
-        "precompiled_lib.tmpl.go",
     ],
     visibility = [
         "//:sandbox",

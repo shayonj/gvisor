@@ -110,13 +110,15 @@ cat > README.md <<EOF
 
 This branch is a synthetic branch, containing only Go sources, that is
 compatible with standard Go tools. See the master branch for authoritative
-sources and tests.
+sources and tests. To precompile runsc's seccomp filters, run
+go run ./runsc/boot/filter/precompile and go run ./runsc/fsgofer/filter/precompile
+on the target architecture before building runsc.
 EOF
 
 # There are a few solitary files that can get left behind due to the way bazel
 # constructs the gopath target. Note that we don't find all Go files here
 # because they may correspond to unused templates, etc.
-declare -ar binaries=( "runsc" "shim" "webhook" "tools/checklocks/cmd/checklocks" )
+declare -ar binaries=( "runsc" "shim" "webhook" "tools/checklocks/cmd/checklocks" "runsc/boot/filter/precompile" "runsc/fsgofer/filter/precompile" )
 for target in "${binaries[@]}"; do
   mkdir -p "${target}"
   cp "${repo_orig}/${target}"/*.go "${target}/"

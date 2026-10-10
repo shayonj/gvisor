@@ -38,19 +38,6 @@ def precompiled_seccomp_rules(
             },
         )
 
-    # This genrule copies precompiled_lib.tmpl.go to the directory of wherever
-    # `precompiled_seccomp_rules` is called.
-    # This allows the go:embed directive inside the `.gen.go` file below to
-    # work without rewriting the full path.
-    native.genrule(
-        name = name + "_gen_lib",
-        outs = [out + ".gen.lib.tmpl.go"],
-        cmd = "cat < $(SRCS) > $@",
-        srcs = [
-            "//pkg/seccomp/precompiledseccomp:precompiled_lib.tmpl.go",
-        ],
-    )
-
     # This genrule generates the Go file of the binary that, when run,
     # precompiles rules and writes them to a designated file.
     gen_cmd_template = (
@@ -59,8 +46,6 @@ def precompiled_seccomp_rules(
         "        {rules_import_echo}" +
         "    elif echo \"$$line\" | grep -q 'PROGRAMS_FUNC_THIS_IS_A_LOAD_BEARING_COMMENT'; then" +
         "        {load_programs_fn_echo}" +
-        "    elif echo \"$$line\" | grep -q 'go:embed precompiled_lib.tmpl.go'; then" +
-        "        echo -e \"//go:embed " + out + ".gen.lib.tmpl.go\";" +
         "    else" +
         "      echo \"$$line\";" +
         "    fi;" +
@@ -111,18 +96,12 @@ def precompiled_seccomp_rules(
         name = name + "_gen_bin",
         srcs = [out + ".gen.go"],
         deps = gen_bin_deps,
-        embedsrcs = [
-            ":" + out + ".gen.lib.tmpl.go",
-        ],
     )
     if exclude_in_fastbuild:
         go_binary(
             name = name + "_gen_stubbed_bin",
             srcs = [out + ".gen_stubbed.go"],
             deps = base_gen_bin_deps,
-            embedsrcs = [
-                ":" + out + ".gen.lib.tmpl.go",
-            ],
         )
 
     # This genrule actually runs the go_binary we just declared, and writes
