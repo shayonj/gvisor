@@ -50,6 +50,7 @@ go_test(
         "console_test.go",
         "container_save_restore_test.go",
         "container_test.go",
+        "erofs_xattr_test.go",
         "metric_server_test.go",
         "multi_container_save_restore_test.go",
         "multi_container_test.go",
@@ -69,6 +70,8 @@ go_test(
     data = [
         "//:release",
         "//test/cmd/test_app",
+        "//test/syscalls/linux:exec_check_creds",
+        "//test/syscalls/linux:xattr_test",
     ],
     embed = [":container"],
     shard_count = most_shards,
@@ -76,6 +79,7 @@ go_test(
     deps = [
         "//pkg/abi/linux",
         "//pkg/cleanup",
+        "//pkg/hostarch",
         "//pkg/hostos",
         "//pkg/log",
         "//pkg/seccheck/scsdk",

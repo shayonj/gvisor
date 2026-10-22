@@ -17,8 +17,10 @@
 #include <limits.h>
 #include <linux/capability.h>
 #include <linux/limits.h>
+#include <linux/prctl.h>
 #include <sched.h>
 #include <stdint.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -28,6 +30,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -35,17 +38,22 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/flags/flag.h"
 #include "absl/strings/string_view.h"
 #include "test/syscalls/linux/file_base.h"
 #include "test/util/capability_util.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
 #include "test/util/linux_capability_util.h"
+#include "test/util/logging.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/save_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
+
+ABSL_FLAG(std::string, xattr_fixture_dir, "",
+          "Path to the read-only EROFS extended attribute fixture");
 
 namespace gvisor {
 namespace testing {
@@ -867,6 +875,192 @@ TEST_F(XattrTest, TrustedNamespaceWithCapSysAdminInNewUserns) {
   // setxattr_in_new_userns() exits with 0 only if it sees an EPERM.
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
       << "status = " << status;
+}
+
+// ErofsXattrTest reads a fixture mounted by the container test or native host.
+class ErofsXattrTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    root_ = absl::GetFlag(FLAGS_xattr_fixture_dir);
+    SKIP_IF(root_.empty());
+  }
+
+  // Path returns a path inside the immutable fixture.
+  std::string Path(const char* name) const { return JoinPath(root_, name); }
+
+  std::string root_;
+};
+
+TEST_F(ErofsXattrTest, ReadValuesAndFileData) {
+  constexpr char kValue[] = "test-value";
+  for (const char* name : {"file", "shared", "directory"}) {
+    SCOPED_TRACE(name);
+    const std::string path = Path(name);
+    EXPECT_THAT(getxattr(path.c_str(), "user.test", nullptr, 0),
+                SyscallSucceedsWithValue(sizeof(kValue) - 1));
+    char value[sizeof(kValue)] = {};
+    ASSERT_THAT(getxattr(path.c_str(), "user.test", value, sizeof(value)),
+                SyscallSucceedsWithValue(sizeof(kValue) - 1));
+    EXPECT_EQ(std::string(value, sizeof(kValue) - 1), kValue);
+    char unique[32] = {};
+    ASSERT_THAT(getxattr(path.c_str(), "user.unique", unique, sizeof(unique)),
+                SyscallSucceedsWithValue(strlen(name)));
+    EXPECT_EQ(std::string(unique, strlen(name)), name);
+  }
+
+  const std::string path = Path("file");
+  FileDescriptor fd(open(path.c_str(), O_RDONLY));
+  ASSERT_THAT(fd.get(), SyscallSucceeds());
+  char value[sizeof(kValue)] = {};
+  ASSERT_THAT(fgetxattr(fd.get(), "user.test", value, sizeof(kValue) - 1),
+              SyscallSucceedsWithValue(sizeof(kValue) - 1));
+  EXPECT_EQ(std::string(value, sizeof(kValue) - 1), kValue);
+  EXPECT_THAT(getxattr(path.c_str(), "user.empty", nullptr, 0),
+              SyscallSucceedsWithValue(0));
+  char binary[4] = {};
+  ASSERT_THAT(getxattr(path.c_str(), "user.binary", binary, sizeof(binary)),
+              SyscallSucceedsWithValue(sizeof(binary)));
+  EXPECT_EQ(std::string(binary, sizeof(binary)), std::string("\0\1\377\0", 4));
+  EXPECT_THAT(getxattr(path.c_str(), "user.missing", nullptr, 0),
+              SyscallFailsWithErrno(ENODATA));
+  EXPECT_THAT(getxattr(path.c_str(), "unknown.name", nullptr, 0),
+              SyscallFailsWithErrno(EOPNOTSUPP));
+  for (const char* name : {"user.", "security."}) {
+    EXPECT_THAT(getxattr(path.c_str(), name, nullptr, 0),
+                SyscallFailsWithErrno(EINVAL));
+  }
+
+  char sentinel = 'x';
+  EXPECT_THAT(getxattr(path.c_str(), "user.test", &sentinel, 1),
+              SyscallFailsWithErrno(ERANGE));
+  EXPECT_EQ(sentinel, 'x');
+  EXPECT_THAT(fgetxattr(fd.get(), "user.test", &sentinel, 1),
+              SyscallFailsWithErrno(ERANGE));
+  EXPECT_EQ(sentinel, 'x');
+
+  std::string contents;
+  ASSERT_NO_ERRNO(GetContents(path, &contents));
+  EXPECT_EQ(contents, "erofs xattr contents\n");
+  ASSERT_NO_ERRNO(GetContents(Path("large"), &contents));
+  EXPECT_EQ(contents, std::string(8193, 'q'));
+}
+
+TEST_F(ErofsXattrTest, ListAndSymlink) {
+  const std::string path = Path("file");
+  constexpr char kNames[] =
+      "user.test\0user.binary\0user.empty\0user.shared\0user.unique";
+  EXPECT_THAT(listxattr(path.c_str(), nullptr, 0),
+              SyscallSucceedsWithValue(sizeof(kNames)));
+  char names[sizeof(kNames)] = {};
+  ASSERT_THAT(listxattr(path.c_str(), names, sizeof(names)),
+              SyscallSucceedsWithValue(sizeof(names)));
+  std::vector<std::string> actual;
+  for (size_t pos = 0; pos < sizeof(names); pos += strlen(names + pos) + 1) {
+    actual.emplace_back(names + pos);
+  }
+  EXPECT_THAT(actual, ::testing::UnorderedElementsAre(
+                          "user.test", "user.binary", "user.empty",
+                          "user.shared", "user.unique"));
+  FileDescriptor fd(open(path.c_str(), O_RDONLY));
+  ASSERT_THAT(fd.get(), SyscallSucceeds());
+  EXPECT_THAT(flistxattr(fd.get(), names, sizeof(names)),
+              SyscallSucceedsWithValue(sizeof(names)));
+  char sentinel = 'x';
+  EXPECT_THAT(listxattr(path.c_str(), &sentinel, 1),
+              SyscallFailsWithErrno(ERANGE));
+  EXPECT_EQ(sentinel, 'x');
+  EXPECT_THAT(flistxattr(fd.get(), &sentinel, 1),
+              SyscallFailsWithErrno(ERANGE));
+  EXPECT_EQ(sentinel, 'x');
+
+  const std::string link = Path("link");
+  EXPECT_THAT(getxattr(link.c_str(), "user.test", nullptr, 0),
+              SyscallSucceedsWithValue(10));
+  EXPECT_THAT(lgetxattr(link.c_str(), "user.test", nullptr, 0),
+              SyscallFailsWithErrno(ENODATA));
+  EXPECT_THAT(llistxattr(link.c_str(), nullptr, 0),
+              SyscallSucceedsWithValue(0));
+}
+
+TEST_F(ErofsXattrTest, Permissions) {
+  AutoCapability cap_override(CAP_DAC_OVERRIDE, false);
+  AutoCapability cap_read_search(CAP_DAC_READ_SEARCH, false);
+  const std::string execute_only = Path("execute-only");
+  for (const char* name : {"user.test", "unknown.name"}) {
+    EXPECT_THAT(getxattr(execute_only.c_str(), name, nullptr, 0),
+                SyscallFailsWithErrno(EACCES));
+  }
+}
+
+TEST_F(ErofsXattrTest, TrustedNamespace) {
+  const std::string path = Path("trusted");
+  SKIP_IF(access(path.c_str(), F_OK) != 0 && errno == ENOENT);
+  EXPECT_THAT(getxattr(path.c_str(), "trusted.test", nullptr, 0),
+              SyscallSucceedsWithValue(7));
+  EXPECT_THAT(listxattr(path.c_str(), nullptr, 0),
+              SyscallSucceedsWithValue(sizeof("trusted.test")));
+  AutoCapability cap_sys_admin(CAP_SYS_ADMIN, false);
+  EXPECT_THAT(getxattr(path.c_str(), "trusted.test", nullptr, 0),
+              SyscallFailsWithErrno(ENODATA));
+  EXPECT_THAT(listxattr(path.c_str(), nullptr, 0), SyscallSucceedsWithValue(0));
+}
+
+TEST_F(ErofsXattrTest, ExecuteOnlyFileCapabilities) {
+  const std::string path = Path("capability");
+  SKIP_IF(access(path.c_str(), F_OK) != 0 && errno == ENOENT);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  SKIP_IF(prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 0);
+  constexpr uint32_t kNetBind = 1U << CAP_NET_BIND_SERVICE;
+  {
+    AutoCapability cap_override(CAP_DAC_OVERRIDE, false);
+    AutoCapability cap_read_search(CAP_DAC_READ_SEARCH, false);
+    FileDescriptor fd(open(path.c_str(), O_RDONLY));
+    EXPECT_THAT(fd.get(), SyscallFailsWithErrno(EACCES));
+    struct vfs_cap_data caps = {};
+    ASSERT_THAT(
+        getxattr(path.c_str(), "security.capability", &caps, sizeof(caps)),
+        SyscallSucceedsWithValue(sizeof(caps)));
+    EXPECT_EQ(caps.magic_etc, VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE);
+    EXPECT_EQ(caps.data[0].permitted, kNetBind);
+  }
+
+  int dumpability = 0;
+  if (!IsRunningOnGvisor()) {
+    std::string contents;
+    ASSERT_NO_ERRNO(GetContents("/proc/sys/fs/suid_dumpable", &contents));
+    dumpability = std::atoi(contents.c_str());
+  }
+  const std::string uid = std::to_string(kNobodyUID);
+  const std::string gid = std::to_string(getegid());
+  const std::string dump = std::to_string(dumpability);
+  pid_t child = fork();
+  ASSERT_THAT(child, SyscallSucceeds());
+  if (child == 0) {
+    TEST_PCHECK(syscall(SYS_setresuid, kNobodyUID, kNobodyUID, kNobodyUID) ==
+                0);
+    execl(path.c_str(), path.c_str(), uid.c_str(), gid.c_str(), dump.c_str(),
+          "400", "400", "0", nullptr);
+    TEST_PCHECK(false);
+  }
+  int status;
+  ASSERT_THAT(waitpid(child, &status, 0), SyscallSucceedsWithValue(child));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "file-capability helper exited with status " << status;
+}
+
+TEST_F(ErofsXattrTest, UnsupportedACLs) {
+  const std::string marker = Path("acl-present");
+  SKIP_IF(access(marker.c_str(), F_OK) != 0 && errno == ENOENT);
+  const std::string path = Path("acl");
+  if (IsRunningOnGvisor()) {
+    FileDescriptor fd(open(path.c_str(), O_RDONLY));
+    EXPECT_THAT(fd.get(), SyscallFailsWithErrno(EOPNOTSUPP));
+  } else {
+    FileDescriptor fd(open(path.c_str(), O_RDONLY));
+    EXPECT_THAT(fd.get(), SyscallSucceeds());
+    EXPECT_THAT(getxattr(path.c_str(), "system.posix_acl_access", nullptr, 0),
+                SyscallSucceedsWithValue(44));
+  }
 }
 
 }  // namespace

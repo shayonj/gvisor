@@ -383,6 +383,13 @@ func (fs *filesystem) getInode(nid uint64) (*inode, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Access checks do not enforce POSIX ACLs. Reject ACL-bearing inodes
+	// rather than grant access using only their mode bits.
+	if hasACL, err := ino.HasPOSIXACL(); err != nil {
+		return nil, err
+	} else if hasACL {
+		return nil, linuxerr.EOPNOTSUPP
+	}
 	return bucket.addInode(nid, func() *inode {
 		i := &inode{
 			Inode: ino,
@@ -860,12 +867,12 @@ func (fd *fileDescription) StatFS(ctx context.Context) (linux.Statfs, error) {
 
 // ListXattr implements vfs.FileDescriptionImpl.ListXattr.
 func (fd *fileDescription) ListXattr(ctx context.Context, size uint64) ([]string, error) {
-	return nil, linuxerr.ENOTSUP
+	return fd.inode().listXattr(auth.CredentialsFromContext(ctx))
 }
 
 // GetXattr implements vfs.FileDescriptionImpl.GetXattr.
 func (fd *fileDescription) GetXattr(ctx context.Context, opts vfs.GetXattrOptions) (string, error) {
-	return "", linuxerr.ENOTSUP
+	return fd.inode().getXattr(auth.CredentialsFromContext(ctx), opts)
 }
 
 // SetXattr implements vfs.FileDescriptionImpl.SetXattr.
