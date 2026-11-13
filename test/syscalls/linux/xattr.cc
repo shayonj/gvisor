@@ -823,6 +823,38 @@ TEST_F(XattrTest, TrustedNamespaceWithoutCapSysAdmin) {
   EXPECT_THAT(removexattr(path, name), SyscallFailsWithErrno(EPERM));
 }
 
+TEST_F(XattrTest, TrustedNamespaceListWithoutCapSysAdmin) {
+  // Gofer does not support trusted namespace.
+  SKIP_IF(IsRunningOnGvisor() &&
+          ASSERT_NO_ERRNO_AND_VALUE(IsGoferfs(test_file_name_)));
+
+  const char* path = test_file_name_.c_str();
+  const char trusted_name[] = "trusted.test";
+  const char user_name[] = "user.test";
+
+  // Setting a trusted.* xattr requires CAP_SYS_ADMIN in the root user
+  // namespace, which is simplest to check by trying it.
+  char val = 'a';
+  if (setxattr(path, trusted_name, &val, sizeof(val), /*flags=*/0) < 0) {
+    SKIP_IF(errno == EPERM || errno == EOPNOTSUPP);
+    FAIL() << "unexpected errno from setxattr: " << errno;
+  }
+  ASSERT_THAT(setxattr(path, user_name, &val, sizeof(val), /*flags=*/0),
+              SyscallSucceeds());
+
+  AutoCapability cap(CAP_SYS_ADMIN, false);
+
+  // The trusted.* xattr exists, but listing hides its name from a caller
+  // without CAP_SYS_ADMIN.
+  char list[sizeof(trusted_name) + sizeof(user_name)];
+  EXPECT_THAT(listxattr(path, list, sizeof(list)),
+              SyscallSucceedsWithValue(sizeof(user_name)));
+  EXPECT_STREQ(list, user_name);
+  EXPECT_THAT(flistxattr(test_file_fd_.get(), list, sizeof(list)),
+              SyscallSucceedsWithValue(sizeof(user_name)));
+  EXPECT_STREQ(list, user_name);
+}
+
 int UnshareAndSetxattrInNewUserns(const char* path) {
   if (syscall(SYS_unshare, CLONE_NEWUSER) == -1) {
     return 1;
