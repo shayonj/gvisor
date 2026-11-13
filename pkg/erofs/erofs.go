@@ -678,6 +678,10 @@ type Extent struct {
 
 	// Mapped is false for a sparse hole, which reads as zeroes.
 	Mapped bool
+
+	// Inline is true for tail-packed inline data, which follows the inode in
+	// its metadata block and so isn't block-aligned in the image.
+	Inline bool
 }
 
 // MapBlocks returns the extent containing offset off of this inode's data.
@@ -698,7 +702,7 @@ func (i *Inode) MapBlocks(off uint64) (Extent, error) {
 		if off < tailOff {
 			e = Extent{Length: tailOff, ImageOff: i.dataOff, Mapped: true}
 		} else {
-			e = Extent{Off: tailOff, Length: i.size - tailOff, ImageOff: i.idataOff, Mapped: true}
+			e = Extent{Off: tailOff, Length: i.size - tailOff, ImageOff: i.idataOff, Mapped: true, Inline: true}
 		}
 
 	case InodeDataLayoutChunkBased:

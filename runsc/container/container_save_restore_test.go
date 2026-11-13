@@ -1265,7 +1265,8 @@ func TestCheckpointRestoreEROFS(t *testing.T) {
 	skipIfNotAvailable(t, "mkfs.erofs", "busybox")
 
 	for _, tc := range []struct{ name, options string }{
-		{name: "flat"},
+		{name: "flat", options: "-E noinline_data"},
+		{name: "inline"},
 		{name: "chunk-blockmap", options: "--chunksize=8192 -E force-inode-blockmap"},
 		{name: "chunk-indexes", options: "--chunksize=8192 -E force-chunk-indexes"},
 	} {

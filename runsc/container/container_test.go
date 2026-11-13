@@ -5296,7 +5296,7 @@ func createRootfsEROFS(dir string, options ...string) (string, string, error) {
 
 	// Build the EROFS rootfs image.
 	rootfsImage := filepath.Join(dir, "rootfs.img")
-	if err := createImageEROFS(rootfsImage, rootfsDir, append([]string{"-E noinline_data"}, options...)...); err != nil {
+	if err := createImageEROFS(rootfsImage, rootfsDir, options...); err != nil {
 		return "", "", fmt.Errorf("error creating EROFS image: %v", err)
 	}
 

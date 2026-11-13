@@ -118,6 +118,69 @@ func TestReadSpansInlineTail(t *testing.T) {
 	}
 }
 
+func TestMMapInlineTail(t *testing.T) {
+	page := int(hostarch.PageSize)
+	for _, size := range []int{904, page + 904} {
+		t.Run(fmt.Sprintf("size=%d", size), func(t *testing.T) {
+			data := newTestImage(0, erofs.InodeCompact{Format: erofs.InodeDataLayoutFlatInline << erofs.InodeDataLayoutBit, Size: uint32(size), RawBlockAddr: 4})
+			want := make([]byte, size)
+			for i := range want {
+				want[i] = byte(i % 251)
+			}
+			tailOff := size &^ (page - 1)
+			copy(data[4*page:], want[:tailOff])
+			// Fill the bytes after the inline data so that a mapping of the
+			// image itself would expose them past EOF.
+			tail := data[testFileNid<<erofs.InodeSlotBits+erofs.InodeCompactSize:][:page]
+			copy(tail, want[tailOff:])
+			for j := size - tailOff; j < page; j++ {
+				tail[j] = 0xff
+			}
+			fd := openTestFile(t, data)
+			ctx := contexttest.Context(t)
+
+			end, _ := hostarch.PageRoundUp(uint64(size))
+			required := memmap.MappableRange{Start: 0, End: end}
+			ts, err := fd.inode().Translate(ctx, required, required, hostarch.Read)
+			if err != nil {
+				t.Fatalf("Translate(%v): %v", required, err)
+			}
+			if err := memmap.CheckTranslateResult(required, required, hostarch.Read, ts, err); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, end)
+			for _, tr := range ts {
+				blocks, err := tr.File.MapInternal(tr.FileRange(), hostarch.Read)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got[tr.Source.Start:tr.Source.End])), blocks); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !bytes.Equal(got[:size], want) {
+				t.Fatal("mmap contents differ")
+			}
+			if !bytes.Equal(got[size:], make([]byte, int(end)-size)) {
+				t.Fatal("mmap exposes nonzero bytes past EOF")
+			}
+
+			// Later faults on the tail map the same copy.
+			r := memmap.MappableRange{Start: uint64(tailOff), End: end}
+			tailTS, err := fd.inode().Translate(ctx, r, r, hostarch.Read)
+			if err != nil {
+				t.Fatalf("Translate(%v): %v", r, err)
+			}
+			if err := memmap.CheckTranslateResult(r, r, hostarch.Read, tailTS, err); err != nil {
+				t.Fatal(err)
+			}
+			if last := ts[len(ts)-1]; tailTS[0].File != last.File || tailTS[0].Offset != last.Offset {
+				t.Errorf("tail translated to %+v, then %+v", last, tailTS[0])
+			}
+		})
+	}
+}
+
 func TestTranslateBeyondEOF(t *testing.T) {
 	file := erofs.InodeCompact{Format: erofs.InodeDataLayoutFlatPlain << erofs.InodeDataLayoutBit, Size: uint32(hostarch.PageSize) + 17, RawBlockAddr: 4}
 	fd := openTestFile(t, newTestImage(0, file))

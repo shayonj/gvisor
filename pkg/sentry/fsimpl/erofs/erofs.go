@@ -20,6 +20,7 @@
 //	  dentry.dirMu
 //	    inode.dirMu
 //	    inodeBucket.mu
+//	      inode.inlineTailMu
 //	    filesystem.cacheMu
 package erofs
 
@@ -358,6 +359,15 @@ type inode struct {
 	// +checklocks:mapsMu
 	mappings memmap.MappingSet
 
+	// inlineTailMu protects inlineTail.
+	inlineTailMu sync.Mutex `state:"nosave"`
+
+	// inlineTail is the range of fs.memoryFile that holds a copy of the file's
+	// tail-packed inline data, zero-filled to a page boundary. It is allocated
+	// when the tail is first mapped and freed with the inode.
+	// +checklocks:inlineTailMu
+	inlineTail memmap.FileRange
+
 	// locks supports POSIX and BSD style locks.
 	locks vfs.FileLocks
 
@@ -402,6 +412,11 @@ func (i *inode) DecRef(ctx context.Context) {
 	defer ib.mu.Unlock()
 	i.inodeRefs.DecRef(func() {
 		ib.removeInodeLocked(nid) // +checklocksforce: ib.mu is locked above.
+		i.inlineTailMu.Lock()
+		if i.inlineTail.Length() != 0 {
+			i.fs.memoryFile.DecRef(i.inlineTail)
+		}
+		i.inlineTailMu.Unlock()
 	})
 }
 
