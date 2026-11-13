@@ -1120,7 +1120,14 @@ func (fd *FileDescription) GetFilePrivileges(ctx context.Context) (auth.FilePriv
 		}
 	}
 
-	fileCaps, err := fd.GetXattr(ctx, &GetXattrOptions{Name: linux.XATTR_SECURITY_CAPABILITY, Size: linux.XATTR_CAPS_SZ_3})
+	// getxattr(2) returns the root ID relative to the caller's user
+	// namespace, but execve(2) uses the root ID relative to the filesystem's
+	// owning user namespace. All filesystems are owned by the initial user
+	// namespace, so read the value as root in that namespace.
+	// ComputeCredsForExec ignores the file capabilities if the root ID does
+	// not own the caller's user namespace.
+	rootCreds := auth.NewRootCredentials(auth.CredentialsFromContext(ctx).UserNamespace.Root())
+	fileCaps, err := fd.GetXattr(auth.ContextWithCredentials(ctx, rootCreds), &GetXattrOptions{Name: linux.XATTR_SECURITY_CAPABILITY, Size: linux.XATTR_CAPS_SZ_3})
 	switch {
 	case linuxerr.Equals(linuxerr.ENODATA, err), linuxerr.Equals(linuxerr.EOPNOTSUPP, err):
 		return filePrivs, nil

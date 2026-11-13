@@ -1351,9 +1351,11 @@ struct FileCapsExecutable {
 };
 
 // Creates a FileCapsExecutable whose file permitted set is `permitted` and
-// whose file effective bit is set. A fresh tmpfs is used because the gofer
-// does not allow setting security.* xattrs.
-PosixErrorOr<FileCapsExecutable> CreateFileCapsExecutable(uint64_t permitted) {
+// whose file effective bit is set. If `root_id` is set, the file capabilities
+// are version 3 with that root user ID; otherwise they are version 2. A fresh
+// tmpfs is used because the gofer does not allow setting security.* xattrs.
+PosixErrorOr<FileCapsExecutable> CreateFileCapsExecutable(
+    uint64_t permitted, absl::optional<uint32_t> root_id = absl::nullopt) {
   std::string exec_blob;
   RETURN_IF_ERRNO(GetContents(RunfilePath(kCheckEuidProgram), &exec_blob));
 
@@ -1364,12 +1366,19 @@ PosixErrorOr<FileCapsExecutable> CreateFileCapsExecutable(uint64_t permitted) {
   ASSIGN_OR_RETURN_ERRNO(TempPath file,
                          TempPath::CreateFileWith(dir.path(), exec_blob, 0755));
 
-  struct vfs_cap_data cap_data = {};
+  // The version 2 value is a prefix of struct vfs_ns_cap_data.
+  struct vfs_ns_cap_data cap_data = {};
   cap_data.magic_etc = VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE;
   cap_data.data[0].permitted = static_cast<uint32_t>(permitted);
   cap_data.data[1].permitted = static_cast<uint32_t>(permitted >> 32);
-  if (setxattr(file.path().c_str(), "security.capability", &cap_data,
-               sizeof(cap_data), 0) < 0) {
+  size_t size = XATTR_CAPS_SZ_2;
+  if (root_id.has_value()) {
+    cap_data.magic_etc = VFS_CAP_REVISION_3 | VFS_CAP_FLAGS_EFFECTIVE;
+    cap_data.rootid = *root_id;
+    size = XATTR_CAPS_SZ_3;
+  }
+  if (setxattr(file.path().c_str(), "security.capability", &cap_data, size,
+               /*flags=*/0) < 0) {
     return PosixError(errno, "setxattr(security.capability)");
   }
   return FileCapsExecutable{std::move(dir), std::move(mount), std::move(file)};
@@ -1460,6 +1469,96 @@ TEST(ExecTest, FileCapsNotGainedWithNoNewPrivs) {
   CheckFileCapsExec(
       /*caps=*/{}, /*ambient=*/0, /*no_new_privs=*/true,
       /*file_permitted=*/kNetBind, /*want=*/{}, /*want_ambient=*/0);
+}
+
+// Execs a FileCapsExecutable that grants CAP_NET_BIND_SERVICE, with version 3
+// root user ID `file_root_id`, from a new user namespace that maps UIDs 0 and 1
+// to kUnprivilegedUid and kUnprivilegedUid + 1. The task runs as UID 1 in that
+// namespace and holds only CAP_NET_BIND_SERVICE. Checks the capability sets
+// after execve.
+void CheckFileCapsExecInUserNamespace(uint32_t file_root_id, CapSet want) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETGID)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETFCAP)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  constexpr uint64_t kNetBind = 1ULL << CAP_NET_BIND_SERVICE;
+  FileCapsExecutable exe = ASSERT_NO_ERRNO_AND_VALUE(
+      CreateFileCapsExecutable(kNetBind, file_root_id));
+
+  const ExecveArray argv = {
+      exe.file.path(),
+      /*want_euid=*/"1",
+      /*want_egid=*/"0",
+      /*want_dumpability=*/absl::StrCat(SUID_DUMP_USER),
+      /*want_permitted=*/absl::StrCat(absl::Hex(want.permitted)),
+      /*want_effective=*/absl::StrCat(absl::Hex(want.effective)),
+      /*want_ambient=*/"0"};
+
+  int child_ready[2];
+  int maps_ready[2];
+  ASSERT_THAT(pipe(child_ready), SyscallSucceeds());
+  ASSERT_THAT(pipe(maps_ready), SyscallSucceeds());
+  const pid_t child = fork();
+  if (child == 0) {
+    TEST_PCHECK(close(child_ready[0]) == 0);
+    TEST_PCHECK(close(maps_ready[1]) == 0);
+    TEST_PCHECK(unshare(CLONE_NEWUSER) == 0);
+    char byte = 0;
+    TEST_PCHECK(write(child_ready[1], &byte, sizeof(byte)) == sizeof(byte));
+    TEST_PCHECK(read(maps_ready[0], &byte, sizeof(byte)) == sizeof(byte));
+
+    TEST_PCHECK(syscall(SYS_setresuid, 1, 1, 1) == 0);
+    struct __user_cap_header_struct header = {_LINUX_CAPABILITY_VERSION_3, 0};
+    struct __user_cap_data_struct caps[_LINUX_CAPABILITY_U32S_3] = {};
+    caps[0].permitted = kNetBind;
+    caps[0].effective = kNetBind;
+    TEST_PCHECK(syscall(SYS_capset, &header, caps) == 0);
+    execve(argv.get()[0], argv.get(), nullptr);
+    TEST_PCHECK_MSG(false, "execve failed");
+  }
+  ASSERT_THAT(child, SyscallSucceeds());
+  ASSERT_THAT(close(child_ready[1]), SyscallSucceeds());
+  ASSERT_THAT(close(maps_ready[0]), SyscallSucceeds());
+  char byte = 0;
+  ASSERT_THAT(read(child_ready[0], &byte, sizeof(byte)),
+              SyscallSucceedsWithValue(sizeof(byte)));
+  const std::string gid_map = absl::StrFormat("0 %d 1", getegid());
+  FileDescriptor gid_map_fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(absl::StrFormat("/proc/%d/gid_map", child), O_WRONLY));
+  ASSERT_THAT(write(gid_map_fd.get(), gid_map.data(), gid_map.size()),
+              SyscallSucceedsWithValue(gid_map.size()));
+  const std::string uid_map = absl::StrFormat("0 %d 2", kUnprivilegedUid);
+  FileDescriptor uid_map_fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(absl::StrFormat("/proc/%d/uid_map", child), O_WRONLY));
+  ASSERT_THAT(write(uid_map_fd.get(), uid_map.data(), uid_map.size()),
+              SyscallSucceedsWithValue(uid_map.size()));
+  ASSERT_THAT(write(maps_ready[1], &byte, sizeof(byte)),
+              SyscallSucceedsWithValue(sizeof(byte)));
+  ASSERT_THAT(close(child_ready[0]), SyscallSucceeds());
+  ASSERT_THAT(close(maps_ready[1]), SyscallSucceeds());
+
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+              SyscallSucceedsWithValue(child));
+  EXPECT_EQ(status, 0);
+}
+
+// File capabilities apply in a user namespace whose root is the root user ID of
+// the file capabilities.
+TEST(ExecTest, FileCapsRootIDOwnsUserNamespace) {
+  constexpr uint64_t kNetBind = 1ULL << CAP_NET_BIND_SERVICE;
+  CheckFileCapsExecInUserNamespace(
+      /*file_root_id=*/kUnprivilegedUid,
+      /*want=*/{.effective = kNetBind, .permitted = kNetBind});
+}
+
+// If the root user ID of the file capabilities is not the root of the user
+// namespace or of an ancestor, execve succeeds and ignores the file
+// capabilities.
+TEST(ExecTest, FileCapsIgnoredIfRootIDDoesNotOwnUserNamespace) {
+  CheckFileCapsExecInUserNamespace(/*file_root_id=*/kUnprivilegedUid + 2,
+                                   /*want=*/{});
 }
 
 TEST(ExecTest, SUIDExecDoesntGainUIDForInterpreterScript) {
