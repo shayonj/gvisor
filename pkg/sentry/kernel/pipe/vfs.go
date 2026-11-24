@@ -121,9 +121,12 @@ func (vp *VFSPipe) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, s
 		// writer, we have to wait for a writer to open the other end.
 		for vp.pipe.isNamed && !nonblocking && !hasWriter && !vp.pipe.HasWriters() &&
 			generation == vp.pipe.writerGeneration.Load() {
-			if !ctx.BlockOn((*waitWriters)(&vp.pipe), waiter.EventInternal) {
+			// As in Linux's wait_for_partner, an interrupted open still
+			// succeeds if the other end opened meanwhile.
+			if !ctx.BlockOn((*waitWriters)(&vp.pipe), waiter.EventInternal) &&
+				generation == vp.pipe.writerGeneration.Load() {
 				fd.vfsfd.DecRef(ctx)
-				return nil, linuxerr.EINTR
+				return nil, linuxerr.ERESTARTSYS
 			}
 		}
 
@@ -132,9 +135,10 @@ func (vp *VFSPipe) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, s
 		vp.pipe.wOpen()
 		for vp.pipe.isNamed && !nonblocking && !vp.pipe.HasReaders() &&
 			tReaders == vp.pipe.totalReaders.Load() {
-			if !ctx.BlockOn((*waitReaders)(&vp.pipe), waiter.EventInternal) {
+			if !ctx.BlockOn((*waitReaders)(&vp.pipe), waiter.EventInternal) &&
+				tReaders == vp.pipe.totalReaders.Load() {
 				fd.vfsfd.DecRef(ctx)
-				return nil, linuxerr.EINTR
+				return nil, linuxerr.ERESTARTSYS
 			}
 		}
 

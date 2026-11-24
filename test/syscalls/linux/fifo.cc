@@ -22,6 +22,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <iterator>
 #include <optional>
 #include <string>
@@ -29,6 +30,8 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/strings/str_cat.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
@@ -228,6 +231,59 @@ TEST(FifoTest, OpenBlockedAndInterrupted) {
 
   EXPECT_THAT(open(fifo.c_str(), O_WRONLY), SyscallFailsWithErrno(EINTR));
   EXPECT_THAT(open(fifo.c_str(), O_RDONLY), SyscallFailsWithErrno(EINTR));
+}
+
+std::atomic<int> restart_signals;
+
+void CountRestartSignal(int sig) { restart_signals.fetch_add(1); }
+
+// Waits until thread tid of this process is in an interruptible sleep.
+PosixError WaitUntilSleeping(pid_t tid) {
+  const std::string path = absl::StrCat("/proc/self/task/", tid, "/stat");
+  while (true) {
+    ASSIGN_OR_RETURN_ERRNO(const std::string stat, GetContents(path));
+    // The state follows the command name, which may contain ") ".
+    const size_t comm_end = stat.rfind(") ");
+    if (comm_end != std::string::npos && comm_end + 2 < stat.size() &&
+        stat[comm_end + 2] == 'S') {
+      return NoError();
+    }
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+}
+
+TEST(FifoTest, OpenBlockedRestartsAfterSignal) {
+  struct sigaction sa = {};
+  sa.sa_handler = CountRestartSignal;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_RESTART;
+  const auto scoped_sigaction =
+      ASSERT_NO_ERRNO_AND_VALUE(ScopedSigaction(SIGUSR1, sa));
+  const auto scoped_sigmask =
+      ASSERT_NO_ERRNO_AND_VALUE(ScopedSignalMask(SIG_UNBLOCK, SIGUSR1));
+
+  for (const int flags : {O_RDONLY, O_WRONLY}) {
+    SCOPED_TRACE(flags == O_RDONLY ? "O_RDONLY" : "O_WRONLY");
+    const TempPath fifo(NewTempAbsPath());
+    ASSERT_THAT(mkfifo(fifo.path().c_str(), 0600), SyscallSucceeds());
+    restart_signals.store(0);
+
+    const pid_t opener = gettid();
+    // Outlives the thread so that the restarted open finds the other end.
+    FileDescriptor other;
+    ScopedThread t([&] {
+      ASSERT_NO_ERRNO(WaitUntilSleeping(opener));
+      ASSERT_THAT(tgkill(getpid(), opener, SIGUSR1), SyscallSucceeds());
+      while (restart_signals.load() == 0) {
+        absl::SleepFor(absl::Milliseconds(1));
+      }
+      other = ASSERT_NO_ERRNO_AND_VALUE(Open(fifo.path(), O_RDWR));
+    });
+
+    EXPECT_NO_ERRNO(Open(fifo.path(), flags));
+    t.Join();
+    EXPECT_EQ(restart_signals.load(), 1);
+  }
 }
 
 TEST(FifoTest, FifoOpenRDWR) {
